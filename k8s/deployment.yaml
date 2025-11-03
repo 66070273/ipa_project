@@ -15,6 +15,6 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: 66070273/nginx-demo:latest
+        image: teerati/nginx-demo:latest
         ports:
         - containerPort: 80
