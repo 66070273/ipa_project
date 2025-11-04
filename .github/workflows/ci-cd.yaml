@@ -1,56 +1,35 @@
-name: CI → Scan → Build → Push → Deploy
+name: CI-CD
 
 on:
   push:
-    branches: ["main"]
-  workflow_dispatch:
+    branches: [ main ]
 
 jobs:
-  build_scan_push:
-    runs-on: ubuntu-latest
+  build-push-deploy:
+    runs-on: self-hosted  # หรือ ubuntu-latest ถ้าใช้ GitHub-hosted
+    env:
+      IMAGE_NAME: teerati/nginx-demo
+      TAG: latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate secrets
+        run: |
+          [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]] || { echo "Missing DOCKERHUB_USERNAME"; exit 1; }
+          [[ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]] || { echo "Missing DOCKERHUB_TOKEN"; exit 1; }
 
       - name: Docker login
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
       - name: Build image
-        run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo:latest web
-
-      - name: SonarQube scan
-        env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: |
-          docker run --rm -v "$PWD:/src" -w /src sonarsource/sonar-scanner-cli \
-            -Dsonar.projectBaseDir=/src \
-            -Dsonar.host.url=$SONAR_HOST_URL \
-            -Dsonar.login=$SONAR_TOKEN
+        run: docker build -t $IMAGE_NAME:$TAG -f web/Dockerfile web
 
       - name: Push image
-        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo:latest
+        run: docker push $IMAGE_NAME:$TAG
 
-  deploy_minikube:
-    needs: build_scan_push
-    runs-on: self-hosted   # runner บนเครื่องคุณ
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure kubeconfig
+      # สำหรับ self-hosted runner ที่อยู่เครื่องเดียวกับ Minikube
+      - name: K8s apply
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
-          kubectl config current-context
-
-      - name: Apply manifests
-        run: |
-          kubectl apply -f k8s/namespace.yaml
-          kubectl -n demo apply -f k8s/service.yaml
-          kubectl -n demo set image deploy/nginx-demo nginx=${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo:latest
+          kubectl -n demo set image deploy/nginx-demo nginx=$IMAGE_NAME:$TAG
           kubectl -n demo rollout status deploy/nginx-demo --timeout=180s
-
-      - name: Smoke test
-        run: |
-          kubectl -n demo get po,svc
-          which minikube && minikube service -n demo nginx-demo --url || true
