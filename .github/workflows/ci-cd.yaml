@@ -100,28 +100,37 @@ jobs:
           echo "Grafana:   http://$(minikube ip):31300"
           echo "Prometheus: http://$(minikube ip):31301"
 
-  velero_backup:
+    velero_backup:
     needs: deploy_minikube
     runs-on: self-hosted
     env:
-      VELERO_CREDS: ${{ secrets.VELERO_CREDS }} # optional; ถ้าไม่มีจะสร้างไฟล์ชั่วคราวให้
+      VELERO_CREDS: ${{ secrets.VELERO_CREDS }} # optional
     steps:
       - name: Install/Verify Velero against MinIO
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
+
+          # 1) Namespace
           kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f - || true
-          if ! velero version >/dev/null 2>&1; then
+
+          # 2) ตรวจว่ามี velero CLI แล้ว
+          if ! command -v velero >/dev/null 2>&1; then
             echo "Please install velero CLI on self-hosted runner"; exit 1
           fi
-          if [ -z "$VELERO_CREDS" ]; then
-            cat > credentials-velero <<'EOF'
-            [default]
-            aws_access_key_id=minioadmin
-            aws_secret_access_key=minioadmin123
-            EOF
+
+          # 3) เขียน credentials แบบปลอดภัย (ไม่ใช้ heredoc)
+          if [[ -n "${VELERO_CREDS:-}" ]]; then
+            printf "%s\n" "${VELERO_CREDS}" > credentials-velero
           else
-            echo "$VELERO_CREDS" > credentials-velero
+            {
+              printf "[default]\n"
+              printf "aws_access_key_id=%s\n" "minioadmin"
+              printf "aws_secret_access_key=%s\n" "minioadmin123"
+            } > credentials-velero
           fi
+
+          # 4) ติดตั้ง/อัปเดต Velero ให้ชี้ MinIO ในคลัสเตอร์ (ต้องมี svc DNS นี้จริง)
           velero install \
             --provider aws \
             --plugins velero/velero-plugin-for-aws:v1.8.2 \
@@ -131,8 +140,12 @@ jobs:
             --use-node-agent \
             --default-volumes-to-fs-backup \
             --namespace velero || true
+
           kubectl -n velero get pods
+
       - name: Run backup of demo namespace
+        shell: bash
         run: |
-          velero backup create demo-$(date +%Y%m%d-%H%M) --include-namespaces $K8S_NS
+          set -euxo pipefail
+          velero backup create "demo-$(date +%Y%m%d-%H%M)" --include-namespaces demo
           velero backup get
