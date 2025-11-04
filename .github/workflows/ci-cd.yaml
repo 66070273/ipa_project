@@ -9,15 +9,13 @@ env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo
   IMAGE_TAG: latest
   K8S_NS: demo
-  # อ่านค่าโหมด/พอร์ตของ Sonar จาก repo variables (ตั้งใน Settings → Secrets and variables → Actions → Variables)
-  SONAR_MODE: ${{ vars.SONAR_MODE }}          # 'SELF_HOSTED' หรือ 'IN_JOB' หรือปล่อยว่างเพื่อปิด
-  SONAR_HOST_PORT: ${{ vars.SONAR_HOST_PORT }} # ปกติ 9000 (ถ้าคุณเปิด 9001 ก็ใส่ 9001)
+  SONAR_MODE: ${{ vars.SONAR_MODE }}           # SELF_HOSTED / IN_JOB / (ว่าง = ข้าม)
+  SONAR_HOST_PORT: ${{ vars.SONAR_HOST_PORT }} # ปกติ 9000
 
 jobs:
   build_and_push:
     runs-on: ubuntu-latest
     env:
-      # expose token ให้ step อ่านผ่าน env (ห้ามอ้าง secrets ใน if โดยตรง)
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -28,19 +26,15 @@ jobs:
       - name: Build image
         run: docker build -t $IMAGE_NAME:$IMAGE_TAG -f web/Dockerfile web
 
-      # ---------- SONAR: โหมด IN_JOB (รัน SonarQube เป็น service ชั่วคราวใน job นี้) ----------
+      # --- Sonar (IN_JOB) ---
       - name: SonarQube Scan (IN_JOB service)
         if: ${{ env.SONAR_MODE == 'IN_JOB' && env.SONAR_TOKEN != '' }}
         run: |
           set -e
           docker network create sqnet || true
           docker run -d --name sq --network sqnet -p 9000:9000 sonarqube:10-community
-          # รอจน ready (สูงสุด ~120s)
           for i in {1..120}; do
-            if curl -sf http://localhost:9000/api/system/status | grep -q '"status":"UP"'; then
-              break
-            fi
-            sleep 1
+            curl -sf http://localhost:9000/api/system/status | grep -q '"status":"UP"' && break || sleep 1
           done
           docker run --rm --network sqnet \
             -e SONAR_HOST_URL=http://sq:9000 \
@@ -50,7 +44,7 @@ jobs:
           docker rm -f sq || true
           docker network rm sqnet || true
 
-      # ---------- SONAR: โหมด SELF_HOSTED (runner บน Mac เข้าถึง Sonar ในเครื่องผ่าน host.docker.internal) ----------
+      # --- Sonar (SELF_HOSTED) ---
       - name: SonarQube Scan (SELF_HOSTED runner)
         if: ${{ env.SONAR_MODE == 'SELF_HOSTED' && env.SONAR_TOKEN != '' }}
         run: |
@@ -67,7 +61,7 @@ jobs:
 
   deploy_minikube:
     needs: build_and_push
-    runs-on: self-hosted    # runner บน Mac ของคุณ
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - name: Apply / Update K8s
@@ -82,29 +76,29 @@ jobs:
     needs: deploy_minikube
     runs-on: self-hosted
     steps:
-      - name: Ensure prometheus-community repo
+      - name: Ensure prometheus repo
         run: |
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
           helm repo update
-      - name: Install/Upgrade kube-prometheus-stack (Prometheus+Grafana)
+      - name: Install/Upgrade kube-prometheus-stack
         run: |
           kubectl create ns monitoring --dry-run=client -o yaml | kubectl apply -f -
           helm upgrade --install kps prometheus-community/kube-prometheus-stack -n monitoring \
             --set grafana.service.type=NodePort \
-            --set grafana.service.nodePort=31300 \
-            --set prometheus.service.type=NodePort \
-            --set prometheus.service.nodePort=31301
+            --set prometheus.service.type=NodePort
           kubectl -n monitoring get pods
-      - name: Grafana/Prometheus URLs
+      - name: Print URLs
         run: |
-          echo "Grafana:   http://$(minikube ip):31300"
-          echo "Prometheus: http://$(minikube ip):31301"
+          G=$(kubectl -n monitoring get svc kps-grafana -o jsonpath='{.spec.ports[0].nodePort}')
+          P=$(kubectl -n monitoring get svc kps-kube-prometheus-stack-prometheus -o jsonpath='{.spec.ports[0].nodePort}')
+          echo "Grafana:     http://$(minikube ip):${G}"
+          echo "Prometheus:  http://$(minikube ip):${P}"
 
-    velero_backup:
+  velero_backup:
     needs: deploy_minikube
     runs-on: self-hosted
     env:
-      VELERO_CREDS: ${{ secrets.VELERO_CREDS }} # optional
+      VELERO_CREDS: ${{ secrets.VELERO_CREDS }} # optional; ถ้าไม่มีจะใช้ค่า minioadmin/minioadmin123 ชั่วคราว
     steps:
       - name: Install/Verify Velero against MinIO
         shell: bash
@@ -114,12 +108,12 @@ jobs:
           # 1) Namespace
           kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f - || true
 
-          # 2) ตรวจว่ามี velero CLI แล้ว
+          # 2) Ensure velero CLI exists
           if ! command -v velero >/dev/null 2>&1; then
             echo "Please install velero CLI on self-hosted runner"; exit 1
           fi
 
-          # 3) เขียน credentials แบบปลอดภัย (ไม่ใช้ heredoc)
+          # 3) Write credentials (no heredoc)
           if [[ -n "${VELERO_CREDS:-}" ]]; then
             printf "%s\n" "${VELERO_CREDS}" > credentials-velero
           else
@@ -130,7 +124,7 @@ jobs:
             } > credentials-velero
           fi
 
-          # 4) ติดตั้ง/อัปเดต Velero ให้ชี้ MinIO ในคลัสเตอร์ (ต้องมี svc DNS นี้จริง)
+          # 4) Install/upgrade Velero pointing to MinIO service inside cluster
           velero install \
             --provider aws \
             --plugins velero/velero-plugin-for-aws:v1.8.2 \
@@ -147,5 +141,5 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          velero backup create "demo-$(date +%Y%m%d-%H%M)" --include-namespaces demo
+          velero backup create "demo-$(date +%Y%m%d-%H%M)" --include-namespaces $K8S_NS
           velero backup get
