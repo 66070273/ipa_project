@@ -1,12 +1,17 @@
-name: CI → Scan → Build → Push → Deploy
+name: CI → Build → (Sonar) → Push → Deploy → Monitoring → Velero
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   workflow_dispatch:
 
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo
+  IMAGE_TAG: latest
+  K8S_NS: demo
+
 jobs:
-  build_scan_push:
+  build_and_push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,42 +20,119 @@ jobs:
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
       - name: Build image
-        run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo:latest web
+        run: docker build -t $IMAGE_NAME:$IMAGE_TAG -f web/Dockerfile web
 
-      - name: SonarQube scan
+      # ---------- SONAR: โหมดใน job (ใช้กับ ubuntu-latest) ----------
+      - name: SonarQube Scan (IN_JOB service)
+        if: ${{ vars.SONAR_MODE == 'IN_JOB' && secrets.SONAR_TOKEN != '' }}
         env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          docker run --rm -v "$PWD:/src" -w /src sonarsource/sonar-scanner-cli \
-            -Dsonar.projectBaseDir=/src \
-            -Dsonar.host.url=$SONAR_HOST_URL \
-            -Dsonar.login=$SONAR_TOKEN
+          # รัน SonarQube service ชั่วคราวใน network เดียวกับ scanner
+          docker network create sqnet || true
+          docker run -d --name sq -p 9000:9000 --network sqnet sonarqube:10-community
+          # รอจน Up (รอ ~60-90s)
+          for i in {1..60}; do curl -sf http://localhost:9000/api/system/status | grep -q '"status":"UP"' && break || sleep 2; done
+          # รันสแกนเนอร์ชี้ไปที่ host 'sq' ใน network เดียวกัน
+          docker run --rm --network sqnet \
+            -e SONAR_HOST_URL=http://sq:9000 \
+            -e SONAR_LOGIN=$SONAR_TOKEN \
+            -v "$PWD:/usr/src" \
+            sonarsource/sonar-scanner-cli:latest
+          docker rm -f sq || true
+          docker network rm sqnet || true
+
+      # ---------- SONAR: โหมด self-hosted (ใช้กับ runner บน Mac) ----------
+      - name: SonarQube Scan (SELF_HOSTED)
+        if: ${{ vars.SONAR_MODE == 'SELF_HOSTED' && secrets.SONAR_TOKEN != '' }}
+        env:
+          SONAR_HOST_PORT: ${{ vars.SONAR_HOST_PORT || '9000' }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          # บน Mac ใช้ host.docker.internal เพื่อเข้าถึง SonarQube ที่รันในเครื่อง
+          docker run --rm \
+            -e SONAR_HOST_URL="http://host.docker.internal:${SONAR_HOST_PORT}" \
+            -e SONAR_LOGIN="$SONAR_TOKEN" \
+            -v "$PWD:/usr/src" \
+            sonarsource/sonar-scanner-cli:latest
 
       - name: Push image
-        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo:latest
+        run: docker push $IMAGE_NAME:$IMAGE_TAG
 
   deploy_minikube:
-    needs: build_scan_push
-    runs-on: self-hosted   # runner บนเครื่องคุณ
+    needs: build_and_push
+    runs-on: self-hosted    # runner บน Mac เครื่องที่มี Minikube
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure kubeconfig
-        run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
-          kubectl config current-context
-
-      - name: Apply manifests
+      - name: Apply / Update K8s
         run: |
           kubectl apply -f k8s/namespace.yaml
-          kubectl -n demo apply -f k8s/service.yaml
-          kubectl -n demo set image deploy/nginx-demo nginx=${{ secrets.DOCKERHUB_USERNAME }}/nginx-demo:latest
-          kubectl -n demo rollout status deploy/nginx-demo --timeout=180s
+          kubectl -n $K8S_NS apply -f k8s/service.yaml
+          kubectl -n $K8S_NS set image deploy/nginx-demo nginx=$IMAGE_NAME:$IMAGE_TAG
+          kubectl -n $K8S_NS rollout status deploy/nginx-demo --timeout=180s
+          kubectl -n $K8S_NS get po,svc
 
-      - name: Smoke test
+  monitoring_stack:
+    needs: deploy_minikube
+    runs-on: self-hosted
+    steps:
+      - name: Ensure prometheus-community repo
         run: |
-          kubectl -n demo get po,svc
-          which minikube && minikube service -n demo nginx-demo --url || true
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+          helm repo update
+      - name: Install/Upgrade kube-prometheus-stack (Prometheus+Grafana)
+        run: |
+          kubectl create ns monitoring --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install kps prometheus-community/kube-prometheus-stack -n monitoring \
+            --set grafana.service.type=NodePort \
+            --set grafana.service.nodePort=31300 \
+            --set prometheus.service.type=NodePort \
+            --set prometheus.service.nodePort=31301
+          kubectl -n monitoring get pods
+      - name: Grafana URL hint
+        run: |
+          echo "Grafana:  http://$(minikube ip):31300"
+          echo "Prometheus: http://$(minikube ip):31301"
+
+  velero_backup:
+    needs: deploy_minikube
+    runs-on: self-hosted
+    steps:
+      - name: Install/Verify Velero against MinIO
+        env:
+          VELERO_CREDS: ${{ secrets.VELERO_CREDS }} # optional; ถ้าไม่มีจะสร้างไฟล์ชั่วคราวให้
+        run: |
+          kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f - || true
+          if ! velero version >/dev/null 2>&1; then
+            echo "Please install velero CLI on self-hosted runner"; exit 1
+          fi
+
+          # ถ้าไม่มี secret creds ใน Secrets จะเขียนไฟล์ชั่วคราวให้ (minioadmin/minioadmin123)
+          if [ -z "$VELERO_CREDS" ]; then
+            cat > credentials-velero <<'EOF'
+            [default]
+            aws_access_key_id=minioadmin
+            aws_secret_access_key=minioadmin123
+            EOF
+          else
+            echo "$VELERO_CREDS" > credentials-velero
+          fi
+
+          # ติดตั้ง velero server ชี้ MinIO ในคลัสเตอร์ (ต้องมี namespace/minio + service minio แล้ว)
+          velero install \
+            --provider aws \
+            --plugins velero/velero-plugin-for-aws:v1.8.2 \
+            --bucket velero \
+            --secret-file ./credentials-velero \
+            --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000 \
+            --use-node-agent \
+            --default-volumes-to-fs-backup \
+            --namespace velero || true
+
+          kubectl -n velero get pods
+
+      - name: Run backup of demo namespace
+        run: |
+          velero backup create demo-$(date +%Y%m%d-%H%M) --include-namespaces $K8S_NS
+          velero backup get
